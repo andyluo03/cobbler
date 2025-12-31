@@ -6,3 +6,4 @@ CMakeCache.txt
 detect_cuda_compute_capabilities.cu
 detect_cuda_version.cc
 cmake_install.cmake
+*.out
