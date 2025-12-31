@@ -22,7 +22,34 @@ class Controller {
     
   private:
     int* instruction_counter_;
+    int* instruction_total_;
     Instruction* instruction_queue_;
 };
+
+template <typename ...T>
+__global__ internalMkRuntime (
+  int* instruction_counter,
+  int* instruction_total,
+  Instruction* instruction_queue
+) {
+  while (true) { // TODO: only do this by threadIdx.x;
+    // 0. Attempt Fetch (ideally this has *low* contention).
+    int pd_instruction_counter = *instruction_counter;
+    int resulting;
+
+    if (pd_instruction_counter < *instruction_total) {
+      resulting = atomicCAS(
+        instruction_counter, 
+        pd_instruction_counter,
+        pd_instruction_counter + 1
+      );
+    }
+
+    if (resulting != pd_instruction_counter) { continue }
+
+
+    // 1. Read Instruction
+  }
+}
 
 }
