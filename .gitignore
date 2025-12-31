@@ -1,1 +1,8 @@
+# Build/Environment
 .venv/
+CMakeFiles/
+CMakeCache.txt
+*.so
+detect_cuda_compute_capabilities.cu
+detect_cuda_version.cc
+cmake_install.cmake
