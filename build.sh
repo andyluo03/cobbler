@@ -1,3 +1,3 @@
 #!/bin/bash
 
-nvcc example.cpp
+nvcc demo/splitk.cu -Iincludes -o splitk.out
