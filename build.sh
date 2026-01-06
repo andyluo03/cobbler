@@ -1,3 +1,3 @@
 #!/bin/bash
 
-nvcc demo/splitk.cu -Iincludes -o splitk.out
+nvcc -std=c++17 -O3 benchmark.cpp kernels/sk_cutlass.cu -Ikernels -Icutlass/include -o bench.out
