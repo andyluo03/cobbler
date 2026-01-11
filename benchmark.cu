@@ -1,36 +1,36 @@
 #include <iostream>
 
-#include <splitk.cuh>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/gemm/device/gemm.h>
+
 #include <curand_kernel.h>
 #include <cublas_v2.h>
 
-constexpr size_t tensorM = 128;
-constexpr size_t tensorN = 128;
+constexpr size_t tensorM = 256;
+constexpr size_t tensorN = 256;
 constexpr size_t tensorK = 16384;
 
 constexpr int maxInput = 1 << 8;
 
-__global__ void prepare_kernels (
-    float *A,
-    float *B
-) {
-    int x = blockDim.x * blockIdx.x + threadIdx.x;
-    int y = blockDim.y * blockIdx.y + threadIdx.y;
+__global__ void randomize_matrix_block (float *A, const int R, const int C) {
+    int x = blockDim.y * blockIdx.y + threadIdx.y;
+    int y = blockDim.x * blockIdx.x + threadIdx.x;
 
-    int linearized =
+    long long linearized =
         (blockIdx.y * gridDim.x + blockIdx.x) * (blockDim.x * blockDim.y) +
         (threadIdx.y * blockDim.x + threadIdx.x);
 
     curandState state;
     curand_init(8, linearized, 0, &state);
 
-    if (x < tensorM && y < tensorK) {
-        A[x * tensorK + y] = maxInput * curand_uniform(&state);
+    if (x < R && y < C) {
+        A[x * C + y] = maxInput * curand_uniform(&state);
     }
+}
 
-    if (x < tensorK && y < tensorN) {
-        B[x * tensorN + y] = maxInput * curand_uniform(&state);
-    }
+void randomize_matrix (float *A, const int R, const int C) {
+    randomize_matrix_block<<<dim3((C+32-1)/32, (R+32-1)/32), dim3(32, 32)>>>(A, R, C);
 }
 
 
@@ -85,31 +85,91 @@ int main () { // Note: timing done via ncu.
     float *dA, *dB;
     cudaMalloc(&dA, sizeof(float) * tensorM * tensorK);
     cudaMalloc(&dB, sizeof(float) * tensorK * tensorN);
-    prepare_kernels<<<dim3((tensorK + 512 - 1)/512),dim3(512, 512)>>>(dA, dB);
+    
+    randomize_matrix(dA, tensorM, tensorK);
+    randomize_matrix(dB, tensorK, tensorN);
+
+    std::cout << "Random matrix generation completed." << std::endl;
 
     // 1. cuBLAS Reference
     cublasHandle_t handle;
     cublasCreate(&handle);
     cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
-
     
     float* cublasC;
     cudaMalloc(&cublasC, sizeof(float) * tensorM * tensorN);
+    cudaMemset(cublasC, 0, sizeof(float) * tensorM * tensorN);
+
     float alpha = 1.0f;
     float beta  = 0.0f;
+
     cublasSgemm(
         handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
-        tensorM, tensorN, tensorK,
+        tensorN, tensorM, tensorK,
         &alpha,
-        dA, tensorM,
-        dB, tensorK,
+        dB, tensorN,
+        dA, tensorK,
         &beta,
-        cublasC, tensorM
+        cublasC, tensorN
     );
 
+    std::cout << "cuBLAS reference completed." << std::endl;
+
+    // 2. CUTLASS Auto GEMM
+    float* caC;
+    cudaMalloc(&caC, sizeof(float) * tensorM * tensorN);
+    cudaMemset(caC, 0, sizeof(float) * tensorM * tensorN);
+
+    // --- FIX 1: Use proper types for Tensor Cores ---
+    // Tensor Cores use tfloat32_t (TF32) for "float-like" operations.
+    // Standard float is not supported on OpClassTensorOp.
+    using ElementInput = float;
+    using ElementOutput = float;
+    using ElementAccumulator = float;
+
+    using CaGemm = cutlass::gemm::device::Gemm<
+            ElementInput,
+            cutlass::layout::RowMajor,
+            ElementInput,
+            cutlass::layout::RowMajor,      // SIMT supports RowMajor B natively!
+            ElementOutput,
+            cutlass::layout::RowMajor,
+            ElementAccumulator,
+            cutlass::arch::OpClassSimt,     // FIX 1: Target CUDA Cores (SIMT)
+            cutlass::arch::Sm80,            // Architecture
+            cutlass::gemm::GemmShape<128, 128, 8>, // Threadblock (K is usually smaller for SIMT)
+            cutlass::gemm::GemmShape<32, 64, 8>,   // Warp 
+            cutlass::gemm::GemmShape<1, 1, 1>      // FIX 2: Instruction Shape is scalar
+        >;
+
+    CaGemm ca_gemm_op;
+
+    CaGemm::Arguments args(
+            { int(tensorM), int(tensorN), int(tensorK) },  
+            { (ElementInput*)dA, int(tensorK) },           // A, lda
+            { (ElementInput*)dB, int(tensorN) },           // B, ldb
+            { caC, int(tensorN) },                         // C, ldc
+            { caC, int(tensorN) },                         // D, ldd 
+            { alpha, beta }                                
+    );
+
+    cutlass::Status status = ca_gemm_op(args);
+
+    if (status != cutlass::Status::kSuccess) {
+        std::cerr << "CUTLASS GEMM failed: " << int(status) << "\n";
+    }
+
+    if (compare_matrices(cublasC, caC, 0.01, tensorM, tensorN)) {
+        std::cout << "A" << std::endl;
+    } else {
+        std::cout << "B" << std::endl;
+    }
+
+    
     // Cleanup
     cudaFree(dA);
     cudaFree(dB);
     cudaFree(cublasC);
+    cudaFree(caC);
 }
